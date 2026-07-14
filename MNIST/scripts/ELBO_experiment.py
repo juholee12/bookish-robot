@@ -10,7 +10,11 @@ import torch.nn.functional as F
 
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import os
+import glob
 import random
 from datetime import datetime
 from pathlib import Path
@@ -67,9 +71,28 @@ print(f"RUN_ID: {RUN_ID}  (outputs -> {ROOT})")
 model_saved_path = os.path.join(ROOT, "model_saved")
 data_saved_path = os.path.join(ROOT, "data_saved")
 results_saved_path = os.path.join(ROOT, "results_saved")
+picture_saved_path = os.path.join(ROOT, "picture_saved")
 os.makedirs(results_saved_path, exist_ok=True)
 os.makedirs(model_saved_path, exist_ok=True)
 os.makedirs(data_saved_path, exist_ok=True)
+os.makedirs(picture_saved_path, exist_ok=True)
+
+
+def save_preview_grid(images, labels, save_path, per_class=5, num_classes=10):
+    """Cheap PNG preview: a handful of samples per digit, not the full batch."""
+    images = images.detach().cpu()
+    labels = labels.detach().cpu()
+    fig, axes = plt.subplots(num_classes, per_class, figsize=(1.5 * per_class, 1.5 * num_classes))
+    for c in range(num_classes):
+        idx = (labels == c).nonzero(as_tuple=True)[0][:per_class]
+        for j in range(per_class):
+            ax = axes[c, j]
+            ax.axis("off")
+            if j < len(idx):
+                ax.imshow(images[idx[j]].squeeze().numpy(), cmap="gray")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100)
+    plt.close(fig)
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -78,6 +101,11 @@ full_dataset = datasets.MNIST(root="./data", train=True, download=True, transfor
 test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
 test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 full_digit_indices = utils.create_balanced_subset_indices(full_dataset, seed=base_seed)
+
+# Real-image FID features never change across iterations, so compute them once
+# and reuse for every fid_unfiltered/fid_filtered call instead of re-running
+# Inception over the same 10,000 real test images every time.
+real_fid_metric = fid_helper.build_cached_real_fid(test_dataset, device=device)
 
 # ---------------------------------------------------------------------------
 # Train init model on 500 real samples
@@ -99,7 +127,7 @@ print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val
 delta_size = 5_000
 total_iterations = 50
 test_results = {
-    "model_name": [], "fid": [], "fid_unfiltered": [], "fid_filtered": [],
+    "model_name": [], "fid_unfiltered": [], "fid_filtered": [],
     "val_loss": [], "val_recon": [], "val_kl": [],
     "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
@@ -152,9 +180,10 @@ for i, synthetic_size in enumerate(size_schedule):
         {"images": unfiltered_images.cpu(), "labels": unfiltered_labels.cpu()},
         os.path.join(unfiltered_data_path, "unfiltered.pt"),
     )
-    fid_unfiltered = fid_helper.calculate_fid_score(
-        test_dataset, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
+    fid_unfiltered = fid_helper.calculate_fid_score_cached(
+        real_fid_metric, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
     )
+    save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
     del unfiltered_images, unfiltered_labels
 
     # Generate Synthetic Data
@@ -165,11 +194,17 @@ for i, synthetic_size in enumerate(size_schedule):
         selection_threshold=filter_thres, verbose=False, use_quantile_filtering=True,
     )
 
+    # Preview grid from the first saved shard (already written to disk, no extra generation)
+    first_shard = sorted(glob.glob(os.path.join(synthetic_data_load_path, "*.pt")))[0]
+    shard_data = torch.load(first_shard, map_location="cpu")
+    save_preview_grid(shard_data["images"], shard_data["labels"], os.path.join(picture_saved_path, f"iter{i}_filtered.png"))
+    del shard_data
+
     # Train Synthetic Model
     synthetic_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=True)
 
     # Measure FID directly on the filtered data used to train the next model
-    fid_filtered = fid_helper.calculate_fid_score(test_dataset, synthetic_loader.dataset, device=device)
+    fid_filtered = fid_helper.calculate_fid_score_cached(real_fid_metric, synthetic_loader.dataset, device=device)
 
     synthetic_model = models.CVAE(
         input_dim=784, label_dim=10, latent_dim=20,
@@ -180,11 +215,9 @@ for i, synthetic_size in enumerate(size_schedule):
     this_model = synthetic_model
     all_models.append(this_model)
 
-    fid = fid_helper.calculate_fid_from_model(real_ds=test_dataset, model=this_model, device=device)
     val_loss, val_recon, val_kl = train_helper.calculate_validation_loss(this_model, test_loader, device)
 
     test_results["model_name"].append(this_model.get_name())
-    test_results["fid"].append(fid)
     test_results["fid_unfiltered"].append(fid_unfiltered)
     test_results["fid_filtered"].append(fid_filtered)
     test_results["val_loss"].append(val_loss)
@@ -196,7 +229,6 @@ for i, synthetic_size in enumerate(size_schedule):
 
     append_result(csv_path, {
         "model_name": test_results["model_name"][-1],
-        "fid": test_results["fid"][-1],
         "fid_unfiltered": test_results["fid_unfiltered"][-1],
         "fid_filtered": test_results["fid_filtered"][-1],
         "val_loss": test_results["val_loss"][-1],
@@ -207,7 +239,7 @@ for i, synthetic_size in enumerate(size_schedule):
         "disc_test_accuracy": test_results["disc_test_accuracy"][-1],
     })
 
-    print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID: {test_results['fid'][-1]:.2f},  Test NELBO: {test_results['val_loss'][-1]:.2f}")
+    print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, Test NELBO: {test_results['val_loss'][-1]:.2f}")
 
     del synthetic_loader
     del disc_model
