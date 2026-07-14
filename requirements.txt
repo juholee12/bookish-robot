@@ -1,8 +1,10 @@
-# XSUM news summarization pipeline
 torch>=2.0.0
-transformers>=4.30.0
-datasets>=2.14.0
+torchvision>=0.15.0
+pandas>=1.5.0
 numpy>=1.24.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+torchmetrics>=0.11.0
+torch-fidelity
 tqdm>=4.65.0
 loguru>=0.7.0
-rouge-score>=0.1.2
