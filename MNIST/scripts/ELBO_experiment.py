@@ -36,10 +36,24 @@ np.random.seed(base_seed)
 random.seed(base_seed)
 
 try:
-    from google.colab import drive
-    drive.mount("/content/drive")
-    DRIVE_BASE = Path("/content/drive/MyDrive/verified_synthetic_data/MNIST")
+    import google.colab  # noqa: F401
+    IN_COLAB = True
 except ImportError:
+    IN_COLAB = False
+
+if IN_COLAB:
+    drive_mountpoint = Path("/content/drive")
+    if not (drive_mountpoint / "MyDrive").is_dir():
+        # drive.mount() talks to the notebook's IPython kernel to do the
+        # OAuth/mount handshake. That link doesn't exist when this script is
+        # run as a subprocess (e.g. `!python ELBO_experiment.py`), so it will
+        # crash here in that case. Mount Drive from an actual notebook cell
+        # first (`from google.colab import drive; drive.mount('/content/drive')`)
+        # before launching this script that way.
+        from google.colab import drive
+        drive.mount(str(drive_mountpoint))
+    DRIVE_BASE = drive_mountpoint / "MyDrive" / "verified_synthetic_data" / "MNIST"
+else:
     DRIVE_BASE = THIS_DIR.parent
 
 # Each run gets its own timestamped subfolder so reruns never overwrite or
