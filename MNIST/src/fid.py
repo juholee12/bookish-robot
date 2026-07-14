@@ -105,6 +105,11 @@ def extract_inception_features(fid_metric: FrechetInceptionDistance, dataset, ba
     for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
         imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
         imgs = _preprocess_fid_batch(imgs).to(device, non_blocking=True)
+        # fid_metric.inception expects torch.uint8 in [0, 255]; FrechetInceptionDistance.update()
+        # normally does this (imgs * 255).byte() conversion internally before calling .inception,
+        # but calling .inception directly (to get raw features instead of just the FID scalar)
+        # bypasses that, so it has to be done here explicitly.
+        imgs = (imgs * 255).byte()
         features.append(fid_metric.inception(imgs).cpu())
 
     return torch.cat(features, dim=0).numpy()
