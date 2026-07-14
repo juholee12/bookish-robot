@@ -17,7 +17,10 @@ import os
 import glob
 import random
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
+
+KST = ZoneInfo("Asia/Seoul")
 
 THIS_DIR = Path(__file__).resolve().parent
 SRC_DIR = THIS_DIR.parent / "src"
@@ -64,7 +67,7 @@ else:
 # get appended on top of a previous run's data/results. Set the RUN_ID env
 # var yourself before running if you want to deliberately continue writing
 # into an existing run's folder instead of starting a new one.
-RUN_ID = os.environ.get("RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_ID = os.environ.get("RUN_ID") or datetime.now(KST).strftime("%Y%m%d_%H%M%S")
 ROOT = DRIVE_BASE / "runs" / RUN_ID
 print(f"RUN_ID: {RUN_ID}  (outputs -> {ROOT})")
 
