@@ -85,6 +85,8 @@ def save_preview_grid(images, labels, save_path, per_class=5, num_classes=10):
     """Cheap PNG preview: a handful of samples per digit, not the full batch."""
     images = images.detach().cpu()
     labels = labels.detach().cpu()
+    if images.dim() == 2 and images.shape[1] == 784:
+        images = images.view(-1, 1, 28, 28)
     fig, axes = plt.subplots(num_classes, per_class, figsize=(1.5 * per_class, 1.5 * num_classes))
     for c in range(num_classes):
         idx = (labels == c).nonzero(as_tuple=True)[0][:per_class]
@@ -109,6 +111,43 @@ full_digit_indices = utils.create_balanced_subset_indices(full_dataset, seed=bas
 # and reuse for every fid_unfiltered/fid_filtered call instead of re-running
 # Inception over the same 10,000 real test images every time.
 real_fid_metric = fid_helper.build_cached_real_fid(test_dataset, device=device)
+
+
+def _build_real_half(real_dataset, device):
+    """One-time extraction of a real dataset's images + one-hot(digit, is_real=1) labels."""
+    real_images = torch.stack([real_dataset[i][0] for i in range(len(real_dataset))]).to(device)
+    real_labels = torch.tensor([real_dataset[i][1] for i in range(len(real_dataset))], dtype=torch.long, device=device)
+    y_real_labels = torch.cat([
+        F.one_hot(real_labels, num_classes=10).float(),
+        torch.ones(len(real_dataset), 1, dtype=torch.long, device=device),
+    ], dim=1)
+    return real_images, y_real_labels
+
+
+def build_discriminator_dataset_cached(real_images, y_real_labels, synthetic_model, device):
+    """Same output as data_helper.prepare_discriminator_dataset_with_labels, but
+    reuses a precomputed real-image half instead of re-extracting it every call."""
+    real_size = real_images.shape[0]
+    synthetic_images, synthetic_labels = data_helper.generate_balanced_synthetic_data(
+        synthetic_model, real_size, device=device,
+    )
+    synthetic_images = synthetic_images.to(device)
+    synthetic_labels = synthetic_labels.to(device)
+    y_synthetic_labels = torch.cat([
+        F.one_hot(synthetic_labels, num_classes=10).float(),
+        torch.zeros(len(synthetic_images), 1, dtype=torch.long, device=device),
+    ], dim=1)
+    X_all = torch.cat([real_images, synthetic_images], dim=0)
+    y_all = torch.cat([y_real_labels, y_synthetic_labels], dim=0)
+    return TensorDataset(X_all, y_all)
+
+
+# The real half of the discriminator's training/validation data never changes
+# across iterations (only this_model's synthetic half does), so extract it
+# from full_dataset/test_dataset once here instead of every iteration.
+print("Precomputing real-image halves for discriminator datasets (cached once, reused every iteration)...")
+real_images_full, y_real_labels_full = _build_real_half(full_dataset, device)
+real_images_test, y_real_labels_test = _build_real_half(test_dataset, device)
 
 # ---------------------------------------------------------------------------
 # Train init model on 500 real samples
@@ -155,10 +194,10 @@ for i, synthetic_size in enumerate(size_schedule):
     i = i + 1
     synthetic_size = int(synthetic_size)
 
-    discriminator_dataset = data_helper.prepare_discriminator_dataset_with_labels(full_dataset, this_model, device)
+    discriminator_dataset = build_discriminator_dataset_cached(real_images_full, y_real_labels_full, this_model, device)
     disc_loader = DataLoader(discriminator_dataset, batch_size=128, shuffle=True)
 
-    disc_test_dataset = data_helper.prepare_discriminator_dataset_with_labels(test_dataset, this_model, device)
+    disc_test_dataset = build_discriminator_dataset_cached(real_images_test, y_real_labels_test, this_model, device)
     disc_test_loader = DataLoader(disc_test_dataset, batch_size=128, shuffle=True)
 
     # Train Discriminator with Label Smoothing and dropout
