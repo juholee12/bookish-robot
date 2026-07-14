@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import os
 import glob
 import random
+import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -72,12 +73,10 @@ ROOT = DRIVE_BASE / "runs" / RUN_ID
 print(f"RUN_ID: {RUN_ID}  (outputs -> {ROOT})")
 
 model_saved_path = os.path.join(ROOT, "model_saved")
-data_saved_path = os.path.join(ROOT, "data_saved")
 results_saved_path = os.path.join(ROOT, "results_saved")
 picture_saved_path = os.path.join(ROOT, "picture_saved")
 os.makedirs(results_saved_path, exist_ok=True)
 os.makedirs(model_saved_path, exist_ok=True)
-os.makedirs(data_saved_path, exist_ok=True)
 os.makedirs(picture_saved_path, exist_ok=True)
 
 
@@ -166,14 +165,21 @@ print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val
 # ---------------------------------------------------------------------------
 # Initialize results dict and size schedule
 # ---------------------------------------------------------------------------
-delta_size = 5_000
+# Fixed size per iteration ("Replace" setting: each model is trained only on a
+# freshly resampled, constant-size synthetic batch from the previous model,
+# discarding all prior generations - matches Gerstgrasser et al. 2024's
+# classic model-collapse baseline, as opposed to a growing "Replace-Multiple"
+# schedule). 10,000 keeps FID reasonably well-conditioned (Inception features
+# are 2048-dim; too few samples biases FID upward from sampling noise alone)
+# while staying far cheaper per-iteration than the old growing schedule.
+delta_size = 10_000
 total_iterations = 50
 test_results = {
     "model_name": [], "fid_unfiltered": [], "fid_filtered": [],
     "val_loss": [], "val_recon": [], "val_kl": [],
     "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
-size_schedule = [delta_size * i for i in range(1, total_iterations + 1)]
+size_schedule = [delta_size] * total_iterations
 all_models = []
 
 csv_path = os.path.join(results_saved_path, f"label_smoothing_D{delta_size}_results.csv")
@@ -212,15 +218,10 @@ for i, synthetic_size in enumerate(size_schedule):
     print("disc_val_last_summary:", disc_history['val_last_summary'])
     print(f"filter_thres: {filter_thres}")
 
-    # Generate + save unfiltered synthetic data from the current generator, and measure its FID directly
-    unfiltered_data_path = os.path.join(data_saved_path, f'iter{i}_unfiltered')
-    os.makedirs(unfiltered_data_path, exist_ok=True)
+    # Generate unfiltered synthetic data from the current generator (kept in memory only,
+    # never written to disk) and measure its FID directly
     unfiltered_images, unfiltered_labels = data_helper.generate_balanced_synthetic_data(
         synthetic_model=this_model, target_size=synthetic_size, device=device,
-    )
-    torch.save(
-        {"images": unfiltered_images.cpu(), "labels": unfiltered_labels.cpu()},
-        os.path.join(unfiltered_data_path, "unfiltered.pt"),
     )
     fid_unfiltered = fid_helper.calculate_fid_score_cached(
         real_fid_metric, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
@@ -228,8 +229,11 @@ for i, synthetic_size in enumerate(size_schedule):
     save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
     del unfiltered_images, unfiltered_labels
 
-    # Generate Synthetic Data
-    synthetic_data_load_path = os.path.join(data_saved_path, f'iter{i}_filtered')
+    # Generate filtered synthetic data into a local scratch directory (not under Drive's
+    # persistent ROOT) since generate_balanced_images_with_filtering/create_directory_based_dataloader
+    # require a directory of .pt shards to work from - this gets deleted at the end of the
+    # iteration instead of being kept in data_saved.
+    synthetic_data_load_path = tempfile.mkdtemp(prefix=f"iter{i}_filtered_")
     data_helper.generate_balanced_images_with_filtering(
         model=this_model, save_directory=synthetic_data_load_path,
         total_samples=synthetic_size, discriminator=disc_model,
@@ -242,8 +246,9 @@ for i, synthetic_size in enumerate(size_schedule):
     save_preview_grid(shard_data["images"], shard_data["labels"], os.path.join(picture_saved_path, f"iter{i}_filtered.png"))
     del shard_data
 
-    # Train Synthetic Model
-    synthetic_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=True)
+    # Train Synthetic Model (keep_data=False: scratch directory is deleted once synthetic_loader
+    # goes out of scope below, instead of persisting to Drive)
+    synthetic_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=False)
 
     # Measure FID directly on the filtered data used to train the next model
     fid_filtered = fid_helper.calculate_fid_score_cached(real_fid_metric, synthetic_loader.dataset, device=device)
