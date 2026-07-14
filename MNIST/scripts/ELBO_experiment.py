@@ -111,6 +111,15 @@ full_digit_indices = utils.create_balanced_subset_indices(full_dataset, seed=bas
 # Inception over the same 10,000 real test images every time.
 real_fid_metric = fid_helper.build_cached_real_fid(test_dataset, device=device)
 
+# Same real-image Inception features, reused for Density/Coverage every
+# iteration instead of re-extracting them each time. real_dc_radii (each real
+# sample's k-th nearest-neighbor distance to other real samples) is also
+# cached once here since it only depends on real_prdc_features, which never
+# changes - this is the expensive (N_real x N_real) part of the computation.
+PRDC_NEAREST_K = 5
+real_prdc_features = fid_helper.extract_inception_features(real_fid_metric, test_dataset, device=device)
+real_dc_radii = fid_helper.build_cached_real_dc_radii(real_prdc_features, PRDC_NEAREST_K)
+
 
 def _build_real_half(real_dataset, device):
     """One-time extraction of a real dataset's images + one-hot(digit, is_real=1) labels."""
@@ -176,6 +185,8 @@ delta_size = 10_000
 total_iterations = 50
 test_results = {
     "model_name": [], "fid_unfiltered": [], "fid_filtered": [],
+    "density_unfiltered": [], "coverage_unfiltered": [],
+    "density_filtered": [], "coverage_filtered": [],
     "val_loss": [], "val_recon": [], "val_kl": [],
     "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
@@ -226,8 +237,12 @@ for i, synthetic_size in enumerate(size_schedule):
     fid_unfiltered = fid_helper.calculate_fid_score_cached(
         real_fid_metric, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
     )
+    unfiltered_features = fid_helper.extract_inception_features(
+        real_fid_metric, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
+    )
+    dc_unfiltered = fid_helper.compute_density_coverage(real_dc_radii, real_prdc_features, unfiltered_features, PRDC_NEAREST_K)
     save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
-    del unfiltered_images, unfiltered_labels
+    del unfiltered_images, unfiltered_labels, unfiltered_features
 
     # Generate filtered synthetic data into a local scratch directory (not under Drive's
     # persistent ROOT) since generate_balanced_images_with_filtering/create_directory_based_dataloader
@@ -252,6 +267,9 @@ for i, synthetic_size in enumerate(size_schedule):
 
     # Measure FID directly on the filtered data used to train the next model
     fid_filtered = fid_helper.calculate_fid_score_cached(real_fid_metric, synthetic_loader.dataset, device=device)
+    filtered_features = fid_helper.extract_inception_features(real_fid_metric, synthetic_loader.dataset, device=device)
+    dc_filtered = fid_helper.compute_density_coverage(real_dc_radii, real_prdc_features, filtered_features, PRDC_NEAREST_K)
+    del filtered_features
 
     synthetic_model = models.CVAE(
         input_dim=784, label_dim=10, latent_dim=20,
@@ -267,6 +285,10 @@ for i, synthetic_size in enumerate(size_schedule):
     test_results["model_name"].append(this_model.get_name())
     test_results["fid_unfiltered"].append(fid_unfiltered)
     test_results["fid_filtered"].append(fid_filtered)
+    test_results["density_unfiltered"].append(dc_unfiltered["density"])
+    test_results["coverage_unfiltered"].append(dc_unfiltered["coverage"])
+    test_results["density_filtered"].append(dc_filtered["density"])
+    test_results["coverage_filtered"].append(dc_filtered["coverage"])
     test_results["val_loss"].append(val_loss)
     test_results["val_recon"].append(val_recon)
     test_results["val_kl"].append(val_kl)
@@ -278,6 +300,10 @@ for i, synthetic_size in enumerate(size_schedule):
         "model_name": test_results["model_name"][-1],
         "fid_unfiltered": test_results["fid_unfiltered"][-1],
         "fid_filtered": test_results["fid_filtered"][-1],
+        "density_unfiltered": test_results["density_unfiltered"][-1],
+        "coverage_unfiltered": test_results["coverage_unfiltered"][-1],
+        "density_filtered": test_results["density_filtered"][-1],
+        "coverage_filtered": test_results["coverage_filtered"][-1],
         "val_loss": test_results["val_loss"][-1],
         "val_recon": test_results["val_recon"][-1],
         "val_kl": test_results["val_kl"][-1],
@@ -286,7 +312,8 @@ for i, synthetic_size in enumerate(size_schedule):
         "disc_test_accuracy": test_results["disc_test_accuracy"][-1],
     })
 
-    print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, Test NELBO: {test_results['val_loss'][-1]:.2f}")
+    print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, "
+          f"Coverage filtered: {test_results['coverage_filtered'][-1]:.3f}, Density filtered: {test_results['density_filtered'][-1]:.3f}, Test NELBO: {test_results['val_loss'][-1]:.2f}")
 
     del synthetic_loader
     del disc_model

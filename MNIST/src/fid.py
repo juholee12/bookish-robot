@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from scipy.linalg import sqrtm
+from scipy.spatial.distance import cdist
 from tqdm import tqdm
 import os
 import torch
@@ -87,6 +88,62 @@ def calculate_fid_score_cached(fid_metric: FrechetInceptionDistance, synth_ds, b
     score = float(fid_metric.compute())
     fid_metric.reset()  # only resets the fake-side accumulator; real stats stay cached
     return score
+
+
+@torch.no_grad()
+def extract_inception_features(fid_metric: FrechetInceptionDistance, dataset, batch_size: int = 256, device: torch.device = None) -> np.ndarray:
+    """
+    Extract raw (N, 2048) Inception features for a dataset, reusing the same
+    Inception network already loaded inside fid_metric (built by
+    build_cached_real_fid) so no separate feature-extraction model is needed.
+    Used for PRDC (precision/recall/density/coverage) metrics.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    features = []
+    for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+        imgs = _preprocess_fid_batch(imgs).to(device, non_blocking=True)
+        features.append(fid_metric.inception(imgs).cpu())
+
+    return torch.cat(features, dim=0).numpy()
+
+
+def build_cached_real_dc_radii(real_features: np.ndarray, nearest_k: int) -> np.ndarray:
+    """
+    One-time computation of each real sample's k-th nearest-neighbor distance
+    among the *other* real samples (Naeem et al. 2020 / the `prdc` package's
+    density & coverage formulas). This only depends on real_features, which
+    never changes across iterations, so compute it once and reuse it -
+    avoids recomputing an (N_real x N_real) pairwise distance matrix every call.
+    """
+    distances = cdist(real_features, real_features)
+    # np.partition(..., k)[:, k] gives the (k+1)-th smallest value per row;
+    # since distance-to-self (0) always occupies the smallest slot, this
+    # correctly yields the k-th nearest *other* point's distance.
+    return np.partition(distances, nearest_k, axis=-1)[:, nearest_k]
+
+
+def compute_density_coverage(real_dc_radii: np.ndarray, real_features: np.ndarray, fake_features: np.ndarray, nearest_k: int) -> dict:
+    """
+    Density and Coverage only - deliberately skips precision/recall. Recall is
+    the only one of the four PRDC metrics that needs a fake-vs-fake pairwise
+    distance matrix; density/coverage only need real-vs-real (passed in
+    pre-cached via build_cached_real_dc_radii) and real-vs-fake distances, so
+    skipping precision/recall avoids computing that extra matrix entirely.
+    """
+    distance_real_fake = cdist(real_features, fake_features)  # (n_real, n_fake)
+
+    density = (1.0 / nearest_k) * (
+        distance_real_fake < np.expand_dims(real_dc_radii, axis=1)
+    ).sum(axis=0).mean()
+
+    coverage = (
+        distance_real_fake.min(axis=1) < real_dc_radii
+    ).mean()
+
+    return {"density": float(density), "coverage": float(coverage)}
 
 
 def calculate_fid_from_model(real_ds, model, batch_size: int = 128, device: torch.device = None):
