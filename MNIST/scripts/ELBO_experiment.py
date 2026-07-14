@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -34,7 +35,21 @@ torch.cuda.manual_seed_all(base_seed)
 np.random.seed(base_seed)
 random.seed(base_seed)
 
-ROOT = THIS_DIR.parent
+try:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    DRIVE_BASE = Path("/content/drive/MyDrive/verified_synthetic_data/MNIST")
+except ImportError:
+    DRIVE_BASE = THIS_DIR.parent
+
+# Each run gets its own timestamped subfolder so reruns never overwrite or
+# get appended on top of a previous run's data/results. Set the RUN_ID env
+# var yourself before running if you want to deliberately continue writing
+# into an existing run's folder instead of starting a new one.
+RUN_ID = os.environ.get("RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
+ROOT = DRIVE_BASE / "runs" / RUN_ID
+print(f"RUN_ID: {RUN_ID}  (outputs -> {ROOT})")
+
 model_saved_path = os.path.join(ROOT, "model_saved")
 data_saved_path = os.path.join(ROOT, "data_saved")
 results_saved_path = os.path.join(ROOT, "results_saved")
@@ -70,11 +85,20 @@ print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val
 delta_size = 5_000
 total_iterations = 50
 test_results = {
-    "model_name": [], "fid": [], "val_loss": [], "val_recon": [], "val_kl": [],
+    "model_name": [], "fid": [], "fid_unfiltered": [], "fid_filtered": [],
+    "val_loss": [], "val_recon": [], "val_kl": [],
     "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
 size_schedule = [delta_size * i for i in range(1, total_iterations + 1)]
 all_models = []
+
+csv_path = os.path.join(results_saved_path, f"label_smoothing_D{delta_size}_results.csv")
+
+
+def append_result(csv_path, row: dict):
+    row_df = pd.DataFrame([row])
+    header_needed = not os.path.exists(csv_path)
+    row_df.to_csv(csv_path, mode="a", header=header_needed, index=False)
 
 # ---------------------------------------------------------------------------
 # Iterative retraining loop
@@ -104,8 +128,23 @@ for i, synthetic_size in enumerate(size_schedule):
     print("disc_val_last_summary:", disc_history['val_last_summary'])
     print(f"filter_thres: {filter_thres}")
 
+    # Generate + save unfiltered synthetic data from the current generator, and measure its FID directly
+    unfiltered_data_path = os.path.join(data_saved_path, f'iter{i}_unfiltered')
+    os.makedirs(unfiltered_data_path, exist_ok=True)
+    unfiltered_images, unfiltered_labels = data_helper.generate_balanced_synthetic_data(
+        synthetic_model=this_model, target_size=synthetic_size, device=device,
+    )
+    torch.save(
+        {"images": unfiltered_images.cpu(), "labels": unfiltered_labels.cpu()},
+        os.path.join(unfiltered_data_path, "unfiltered.pt"),
+    )
+    fid_unfiltered = fid_helper.calculate_fid_score(
+        test_dataset, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
+    )
+    del unfiltered_images, unfiltered_labels
+
     # Generate Synthetic Data
-    synthetic_data_load_path = os.path.join(data_saved_path, this_model.get_name() + f'_q{filter_thres}_gen{synthetic_size}')
+    synthetic_data_load_path = os.path.join(data_saved_path, f'iter{i}_filtered')
     data_helper.generate_balanced_images_with_filtering(
         model=this_model, save_directory=synthetic_data_load_path,
         total_samples=synthetic_size, discriminator=disc_model,
@@ -113,7 +152,10 @@ for i, synthetic_size in enumerate(size_schedule):
     )
 
     # Train Synthetic Model
-    synthetic_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=False)
+    synthetic_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=True)
+
+    # Measure FID directly on the filtered data used to train the next model
+    fid_filtered = fid_helper.calculate_fid_score(test_dataset, synthetic_loader.dataset, device=device)
 
     synthetic_model = models.CVAE(
         input_dim=784, label_dim=10, latent_dim=20,
@@ -129,12 +171,27 @@ for i, synthetic_size in enumerate(size_schedule):
 
     test_results["model_name"].append(this_model.get_name())
     test_results["fid"].append(fid)
+    test_results["fid_unfiltered"].append(fid_unfiltered)
+    test_results["fid_filtered"].append(fid_filtered)
     test_results["val_loss"].append(val_loss)
     test_results["val_recon"].append(val_recon)
     test_results["val_kl"].append(val_kl)
     test_results["disc_train_loss"].append(disc_history['best_train_loss'])
     test_results["disc_val_loss"].append(disc_history['best_val_loss'])
     test_results["disc_test_accuracy"].append(disc_history['val_last_summary']['accuracy'])
+
+    append_result(csv_path, {
+        "model_name": test_results["model_name"][-1],
+        "fid": test_results["fid"][-1],
+        "fid_unfiltered": test_results["fid_unfiltered"][-1],
+        "fid_filtered": test_results["fid_filtered"][-1],
+        "val_loss": test_results["val_loss"][-1],
+        "val_recon": test_results["val_recon"][-1],
+        "val_kl": test_results["val_kl"][-1],
+        "disc_train_loss": test_results["disc_train_loss"][-1],
+        "disc_val_loss": test_results["disc_val_loss"][-1],
+        "disc_test_accuracy": test_results["disc_test_accuracy"][-1],
+    })
 
     print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID: {test_results['fid'][-1]:.2f},  Test NELBO: {test_results['val_loss'][-1]:.2f}")
 
@@ -146,10 +203,8 @@ for i, synthetic_size in enumerate(size_schedule):
     del disc_test_loader
 
 # ---------------------------------------------------------------------------
-# Save results
+# Results were appended to csv_path after every iteration above.
 # ---------------------------------------------------------------------------
 res_table = pd.DataFrame.from_dict(test_results, orient="columns")
-csv_path = os.path.join(results_saved_path, f"label_smoothing_D{delta_size}_results.csv")
-res_table.to_csv(csv_path, index=False)
-print(f"\nResults saved to {csv_path}")
+print(f"\nResults saved incrementally to {csv_path}")
 print(res_table)
