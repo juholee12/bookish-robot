@@ -172,7 +172,7 @@ fid = fid_helper.calculate_fid_from_model(real_ds=test_dataset, model=init_model
 print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val_kl", val_kl)
 
 # ---------------------------------------------------------------------------
-# Initialize results dict and size schedule
+# Fixed schedule parameters
 # ---------------------------------------------------------------------------
 # Fixed size per iteration ("Replace" setting: each model is trained only on a
 # freshly resampled, constant-size synthetic batch from the previous model,
@@ -183,12 +183,59 @@ print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val
 # while staying far cheaper per-iteration than the old growing schedule.
 delta_size = 10_000
 total_iterations = 50
+filter_thres = 0.1
+
+# ---------------------------------------------------------------------------
+# One-time discriminator calibration (frozen for all iterations)
+# ---------------------------------------------------------------------------
+# Train a single discriminator once, on init_model's synthetic output vs real
+# data, and calibrate a fixed absolute score threshold from it. Reusing this
+# same discriminator + fixed threshold every iteration (instead of retraining
+# a fresh discriminator and recomputing a fresh top-10% cutoff each round)
+# ensures the quality bar doesn't quietly drift down alongside the
+# generator's own declining output - it's an absolute standard applied by an
+# unchanging measuring instrument, not a moving target, so diversity trends
+# aren't confounded by a filter that silently gets more lenient over time.
+calib_discriminator_dataset = build_discriminator_dataset_cached(real_images_full, y_real_labels_full, init_model, device)
+calib_disc_loader = DataLoader(calib_discriminator_dataset, batch_size=128, shuffle=True)
+
+calib_discriminator_test_dataset = build_discriminator_dataset_cached(real_images_test, y_real_labels_test, init_model, device)
+calib_disc_test_loader = DataLoader(calib_discriminator_test_dataset, batch_size=128, shuffle=True)
+
+disc_model = models.ConditionalDiscriminator(input_dim=784, name="disc_mlp_frozen", arch="mlp", dropout=0.1, label_smoothing=0.05)
+disc_history = train_helper.train_model_with_validation(
+    model=disc_model, train_loader=calib_disc_loader, val_loader=calib_disc_test_loader,
+    device=device, epochs=200, lr=1e-3, wd=0, patience=5, verbose=False,
+)
+print(f"Frozen discriminator trained once on init_model: epochs_trained={disc_history['epochs_trained']}, "
+      f"best_train_loss={disc_history['best_train_loss']}, best_val_loss={disc_history['best_val_loss']}, "
+      f"val_accuracy={disc_history['val_last_summary']['accuracy']}")
+del calib_discriminator_dataset, calib_disc_loader, calib_discriminator_test_dataset, calib_disc_test_loader
+
+# Calibrate a fixed absolute score threshold: score a balanced batch of
+# init_model's own synthetic output, and take the value at the filter_thres
+# quantile - this single number becomes the permanent cutoff for every
+# future iteration, regardless of how that iteration's own scores are
+# distributed.
+disc_model.eval()
+calib_images, calib_labels = data_helper.generate_balanced_synthetic_data(
+    synthetic_model=init_model, target_size=delta_size, device=device,
+)
+calib_labels_onehot = F.one_hot(calib_labels.to(device), num_classes=10).float()
+with torch.no_grad():
+    calib_scores = disc_model.score(calib_images.to(device), calib_labels_onehot).squeeze(1)
+FIXED_SCORE_THRESHOLD = torch.quantile(calib_scores, 1.0 - filter_thres).item()
+print(f"Calibrated fixed discriminator score threshold: {FIXED_SCORE_THRESHOLD:.4f} (top {filter_thres*100:.0f}% of init_model's own output)")
+del calib_images, calib_labels, calib_labels_onehot, calib_scores
+
+# ---------------------------------------------------------------------------
+# Initialize results dict and size schedule
+# ---------------------------------------------------------------------------
 test_results = {
     "model_name": [], "fid_unfiltered": [], "fid_filtered": [],
     "density_unfiltered": [], "coverage_unfiltered": [],
     "density_filtered": [], "coverage_filtered": [],
     "val_loss": [], "val_recon": [], "val_kl": [],
-    "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
 size_schedule = [delta_size] * total_iterations
 all_models = []
@@ -207,27 +254,8 @@ def append_result(csv_path, row: dict):
 this_model = init_model
 
 for i, synthetic_size in enumerate(size_schedule):
-    filter_thres = 0.1
     i = i + 1
     synthetic_size = int(synthetic_size)
-
-    discriminator_dataset = build_discriminator_dataset_cached(real_images_full, y_real_labels_full, this_model, device)
-    disc_loader = DataLoader(discriminator_dataset, batch_size=128, shuffle=True)
-
-    disc_test_dataset = build_discriminator_dataset_cached(real_images_test, y_real_labels_test, this_model, device)
-    disc_test_loader = DataLoader(disc_test_dataset, batch_size=128, shuffle=True)
-
-    # Train Discriminator with Label Smoothing and dropout
-    disc_model = models.ConditionalDiscriminator(input_dim=784, name="disc_mlp_" + str(synthetic_size), arch="mlp", dropout=0.1, label_smoothing=0.05)
-    disc_history = train_helper.train_model_with_validation(
-        model=disc_model, train_loader=disc_loader, val_loader=disc_test_loader,
-        device=device, epochs=200, lr=1e-3, wd=0, patience=5, verbose=False,
-    )
-
-    print(f"Iteration {i}, disc_epochs_trained: {disc_history['epochs_trained']}, disc_best_train_loss: {disc_history['best_train_loss']}, disc_best_val_loss: {disc_history['best_val_loss']}")
-    print("disc_train_last_summary:", disc_history['train_last_summary'])
-    print("disc_val_last_summary:", disc_history['val_last_summary'])
-    print(f"filter_thres: {filter_thres}")
 
     # Generate unfiltered synthetic data from the current generator (kept in memory only,
     # never written to disk) and measure its FID directly
@@ -252,7 +280,7 @@ for i, synthetic_size in enumerate(size_schedule):
     data_helper.generate_balanced_images_with_filtering(
         model=this_model, save_directory=synthetic_data_load_path,
         total_samples=synthetic_size, discriminator=disc_model,
-        selection_threshold=filter_thres, verbose=False, use_quantile_filtering=True,
+        selection_threshold=FIXED_SCORE_THRESHOLD, verbose=False, use_quantile_filtering=False,
     )
 
     # Preview grid from the first saved shard (already written to disk, no extra generation)
@@ -292,9 +320,6 @@ for i, synthetic_size in enumerate(size_schedule):
     test_results["val_loss"].append(val_loss)
     test_results["val_recon"].append(val_recon)
     test_results["val_kl"].append(val_kl)
-    test_results["disc_train_loss"].append(disc_history['best_train_loss'])
-    test_results["disc_val_loss"].append(disc_history['best_val_loss'])
-    test_results["disc_test_accuracy"].append(disc_history['val_last_summary']['accuracy'])
 
     append_result(csv_path, {
         "model_name": test_results["model_name"][-1],
@@ -307,20 +332,12 @@ for i, synthetic_size in enumerate(size_schedule):
         "val_loss": test_results["val_loss"][-1],
         "val_recon": test_results["val_recon"][-1],
         "val_kl": test_results["val_kl"][-1],
-        "disc_train_loss": test_results["disc_train_loss"][-1],
-        "disc_val_loss": test_results["disc_val_loss"][-1],
-        "disc_test_accuracy": test_results["disc_test_accuracy"][-1],
     })
 
     print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, "
           f"Coverage filtered: {test_results['coverage_filtered'][-1]:.3f}, Density filtered: {test_results['density_filtered'][-1]:.3f}, Test NELBO: {test_results['val_loss'][-1]:.2f}")
 
     del synthetic_loader
-    del disc_model
-    del discriminator_dataset
-    del disc_loader
-    del disc_test_dataset
-    del disc_test_loader
 
 # ---------------------------------------------------------------------------
 # Results were appended to csv_path after every iteration above.
