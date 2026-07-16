@@ -17,6 +17,7 @@ import os
 import glob
 import random
 import tempfile
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -75,9 +76,29 @@ print(f"RUN_ID: {RUN_ID}  (outputs -> {ROOT})")
 model_saved_path = os.path.join(ROOT, "model_saved")
 results_saved_path = os.path.join(ROOT, "results_saved")
 picture_saved_path = os.path.join(ROOT, "picture_saved")
+plots_saved_path = os.path.join(results_saved_path, "plots")
 os.makedirs(results_saved_path, exist_ok=True)
 os.makedirs(model_saved_path, exist_ok=True)
 os.makedirs(picture_saved_path, exist_ok=True)
+os.makedirs(plots_saved_path, exist_ok=True)
+
+
+def save_metric_plots(test_results, plots_dir):
+    """One line-graph PNG per numeric metric, overwritten every iteration so a
+    disconnect mid-run still leaves usable plots up to the last completed iteration."""
+    iterations = range(1, len(test_results["model_name"]) + 1)
+    for column, values in test_results.items():
+        if column == "model_name":
+            continue
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(iterations, values, marker="o")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel(column)
+        ax.set_title(f"{column} vs Iteration")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f"{column}.png"), dpi=150)
+        plt.close(fig)
 
 
 def save_preview_grid(images, labels, save_path, per_class=5, num_classes=10):
@@ -116,7 +137,7 @@ real_fid_metric = fid_helper.build_cached_real_fid(test_dataset, device=device)
 # sample's k-th nearest-neighbor distance to other real samples) is also
 # cached once here since it only depends on real_prdc_features, which never
 # changes - this is the expensive (N_real x N_real) part of the computation.
-PRDC_NEAREST_K = 5
+PRDC_NEAREST_K = 10
 real_prdc_features = fid_helper.extract_inception_features(real_fid_metric, test_dataset, device=device)
 real_dc_radii = fid_helper.build_cached_real_dc_radii(real_prdc_features, PRDC_NEAREST_K)
 
@@ -210,7 +231,9 @@ for i, synthetic_size in enumerate(size_schedule):
     filter_thres = 0.1
     i = i + 1
     synthetic_size = int(synthetic_size)
+    iter_start = time.time()
 
+    t0 = time.time()
     discriminator_dataset = build_discriminator_dataset_cached(real_images_full, y_real_labels_full, this_model, device)
     disc_loader = DataLoader(discriminator_dataset, batch_size=128, shuffle=True)
 
@@ -223,6 +246,7 @@ for i, synthetic_size in enumerate(size_schedule):
         model=disc_model, train_loader=disc_loader, val_loader=disc_test_loader,
         device=device, epochs=200, lr=1e-3, wd=0, patience=5, verbose=False,
     )
+    t_discriminator = time.time() - t0
 
     print(f"Iteration {i}, disc_epochs_trained: {disc_history['epochs_trained']}, disc_best_train_loss: {disc_history['best_train_loss']}, disc_best_val_loss: {disc_history['best_val_loss']}")
     print("disc_train_last_summary:", disc_history['train_last_summary'])
@@ -231,6 +255,7 @@ for i, synthetic_size in enumerate(size_schedule):
 
     # Generate unfiltered synthetic data from the current generator (kept in memory only,
     # never written to disk) and measure its FID directly
+    t0 = time.time()
     unfiltered_images, unfiltered_labels = data_helper.generate_balanced_synthetic_data(
         synthetic_model=this_model, target_size=synthetic_size, device=device,
     )
@@ -243,17 +268,20 @@ for i, synthetic_size in enumerate(size_schedule):
     dc_unfiltered = fid_helper.compute_density_coverage(real_dc_radii, real_prdc_features, unfiltered_features, PRDC_NEAREST_K)
     save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
     del unfiltered_images, unfiltered_labels, unfiltered_features
+    t_unfiltered = time.time() - t0
 
     # Generate filtered synthetic data into a local scratch directory (not under Drive's
     # persistent ROOT) since generate_balanced_images_with_filtering/create_directory_based_dataloader
     # require a directory of .pt shards to work from - this gets deleted at the end of the
     # iteration instead of being kept in data_saved.
+    t0 = time.time()
     synthetic_data_load_path = tempfile.mkdtemp(prefix=f"iter{i}_filtered_")
     data_helper.generate_balanced_images_with_filtering(
         model=this_model, save_directory=synthetic_data_load_path,
         total_samples=synthetic_size, discriminator=disc_model,
         selection_threshold=filter_thres, verbose=False, use_quantile_filtering=True,
     )
+    t_filtered_gen = time.time() - t0
 
     # Preview grid from the first saved shard (already written to disk, no extra generation)
     first_shard = sorted(glob.glob(os.path.join(synthetic_data_load_path, "*.pt")))[0]
@@ -266,21 +294,32 @@ for i, synthetic_size in enumerate(size_schedule):
     synthetic_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=False)
 
     # Measure FID directly on the filtered data used to train the next model
+    t0 = time.time()
     fid_filtered = fid_helper.calculate_fid_score_cached(real_fid_metric, synthetic_loader.dataset, device=device)
     filtered_features = fid_helper.extract_inception_features(real_fid_metric, synthetic_loader.dataset, device=device)
     dc_filtered = fid_helper.compute_density_coverage(real_dc_radii, real_prdc_features, filtered_features, PRDC_NEAREST_K)
     del filtered_features
+    t_filtered_metrics = time.time() - t0
 
+    t0 = time.time()
     synthetic_model = models.CVAE(
         input_dim=784, label_dim=10, latent_dim=20,
         name=f"cvae_q{filter_thres}_iter{i}_{synthetic_size}", arch="conv",
     ).to(device)
     train_helper.train_model(synthetic_model, synthetic_loader, device, epochs=200, lr=1e-3, patience=5, verbose=False)
+    t_cvae_train = time.time() - t0
 
     this_model = synthetic_model
     all_models.append(this_model)
 
+    t0 = time.time()
     val_loss, val_recon, val_kl = train_helper.calculate_validation_loss(this_model, test_loader, device)
+    t_validation = time.time() - t0
+
+    iter_total = time.time() - iter_start
+    print(f"[timing] iter {i}: discriminator={t_discriminator:.1f}s, unfiltered_gen+metrics={t_unfiltered:.1f}s, "
+          f"filtered_gen={t_filtered_gen:.1f}s, filtered_metrics={t_filtered_metrics:.1f}s, "
+          f"cvae_train={t_cvae_train:.1f}s, validation={t_validation:.1f}s, TOTAL={iter_total:.1f}s")
 
     test_results["model_name"].append(this_model.get_name())
     test_results["fid_unfiltered"].append(fid_unfiltered)
@@ -311,6 +350,7 @@ for i, synthetic_size in enumerate(size_schedule):
         "disc_val_loss": test_results["disc_val_loss"][-1],
         "disc_test_accuracy": test_results["disc_test_accuracy"][-1],
     })
+    save_metric_plots(test_results, plots_saved_path)
 
     print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, "
           f"Coverage filtered: {test_results['coverage_filtered'][-1]:.3f}, Density filtered: {test_results['density_filtered'][-1]:.3f}, Test NELBO: {test_results['val_loss'][-1]:.2f}")
@@ -327,4 +367,5 @@ for i, synthetic_size in enumerate(size_schedule):
 # ---------------------------------------------------------------------------
 res_table = pd.DataFrame.from_dict(test_results, orient="columns")
 print(f"\nResults saved incrementally to {csv_path}")
+print(f"Per-metric line plots saved to {plots_saved_path}")
 print(res_table)
