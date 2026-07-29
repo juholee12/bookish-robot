@@ -3,7 +3,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from scipy.linalg import sqrtm
-from scipy.spatial.distance import cdist
 from tqdm import tqdm
 import os
 import torch
@@ -91,12 +90,17 @@ def calculate_fid_score_cached(fid_metric: FrechetInceptionDistance, synth_ds, b
 
 
 @torch.no_grad()
-def extract_inception_features(fid_metric: FrechetInceptionDistance, dataset, batch_size: int = 256, device: torch.device = None) -> np.ndarray:
+def extract_inception_features(fid_metric: FrechetInceptionDistance, dataset, batch_size: int = 256, device: torch.device = None) -> torch.Tensor:
     """
     Extract raw (N, 2048) Inception features for a dataset, reusing the same
     Inception network already loaded inside fid_metric (built by
     build_cached_real_fid) so no separate feature-extraction model is needed.
     Used for PRDC (precision/recall/density/coverage) metrics.
+
+    Returned as a GPU tensor (kept on `device`, not moved to CPU/NumPy) so the
+    pairwise-distance computation in build_cached_real_dc_radii/
+    compute_density_coverage can run via torch.cdist on the GPU instead of
+    scipy.cdist on the CPU.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -110,27 +114,93 @@ def extract_inception_features(fid_metric: FrechetInceptionDistance, dataset, ba
         # but calling .inception directly (to get raw features instead of just the FID scalar)
         # bypasses that, so it has to be done here explicitly.
         imgs = (imgs * 255).byte()
-        features.append(fid_metric.inception(imgs).cpu())
+        features.append(fid_metric.inception(imgs))
 
-    return torch.cat(features, dim=0).numpy()
+    return torch.cat(features, dim=0)
 
 
-def build_cached_real_dc_radii(real_features: np.ndarray, nearest_k: int) -> np.ndarray:
+@torch.no_grad()
+def extract_embedding_features(embedding_model, dataset, batch_size: int = 256, device: torch.device = None) -> torch.Tensor:
+    """
+    Extract raw (N, embedding_dim) features using any model exposing an
+    .encode(x) method (e.g. SimpleAutoencoder) - a drop-in replacement for
+    extract_inception_features when using a domain-specific embedding instead
+    of InceptionV3. No 299x299 resize or fake-RGB tripling needed here, since
+    the embedding model is trained directly on 28x28 grayscale digits.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    embedding_model.eval()
+
+    features = []
+    for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+        imgs = imgs.float().to(device, non_blocking=True)
+        if imgs.max() > 1.0:
+            imgs = imgs / 255.0
+        features.append(embedding_model.encode(imgs))
+
+    return torch.cat(features, dim=0)
+
+
+@torch.no_grad()
+def compute_real_fid_stats(real_features: torch.Tensor):
+    """Mean and covariance of real_features, computed once and reused - the
+    other half (besides real_dc_radii) of what's needed to avoid a second
+    embedding pass over the same batch just to get a separate FID number."""
+    mu = real_features.mean(dim=0)
+    centered = real_features - mu
+    sigma = (centered.T @ centered) / (real_features.shape[0] - 1)
+    return mu, sigma
+
+
+@torch.no_grad()
+def calculate_fid_from_features(real_mu: torch.Tensor, real_sigma: torch.Tensor, fake_features: torch.Tensor) -> float:
+    """
+    Standard Frechet distance formula, computed directly from features already
+    extracted for PRDC - avoids running the same batch through the embedding
+    model a second time just to get FID via a separate incremental metric.
+    """
+    fake_mu = fake_features.mean(dim=0)
+    centered = fake_features - fake_mu
+    fake_sigma = (centered.T @ centered) / (fake_features.shape[0] - 1)
+
+    diff = real_mu - fake_mu
+    # sqrtm has no direct GPU equivalent, but this matrix is only
+    # (embedding_dim x embedding_dim) - tiny regardless of how many samples
+    # N was - so moving just this one step to CPU is negligible cost.
+    covmean = sqrtm((real_sigma @ fake_sigma).cpu().numpy(), disp=False)[0]
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    covmean = torch.from_numpy(covmean).to(real_sigma.device, dtype=real_sigma.dtype)
+
+    fid = diff @ diff + torch.trace(real_sigma + fake_sigma - 2 * covmean)
+    return fid.item()
+
+
+@torch.no_grad()
+def build_cached_real_dc_radii(real_features: torch.Tensor, nearest_k: int) -> torch.Tensor:
     """
     One-time computation of each real sample's k-th nearest-neighbor distance
     among the *other* real samples (Naeem et al. 2020 / the `prdc` package's
     density & coverage formulas). This only depends on real_features, which
     never changes across iterations, so compute it once and reuse it -
     avoids recomputing an (N_real x N_real) pairwise distance matrix every call.
+
+    Uses torch.cdist (GPU, if real_features is a GPU tensor) instead of
+    scipy.spatial.distance.cdist (CPU-only) - this pairwise-distance step was
+    the dominant cost in the per-iteration metrics timing breakdown, not the
+    Inception forward pass, so moving it to the GPU is the actual lever here.
     """
-    distances = cdist(real_features, real_features)
-    # np.partition(..., k)[:, k] gives the (k+1)-th smallest value per row;
-    # since distance-to-self (0) always occupies the smallest slot, this
-    # correctly yields the k-th nearest *other* point's distance.
-    return np.partition(distances, nearest_k, axis=-1)[:, nearest_k]
+    distances = torch.cdist(real_features, real_features)
+    # kthvalue is 1-indexed and distance-to-self (0) always occupies rank 1,
+    # so kthvalue(k=nearest_k+1) correctly yields the k-th nearest *other*
+    # point's distance (matches the old np.partition(distances, k)[:, k] logic).
+    return torch.kthvalue(distances, nearest_k + 1, dim=-1).values
 
 
-def compute_density_coverage(real_dc_radii: np.ndarray, real_features: np.ndarray, fake_features: np.ndarray, nearest_k: int) -> dict:
+@torch.no_grad()
+def compute_density_coverage(real_dc_radii: torch.Tensor, real_features: torch.Tensor, fake_features: torch.Tensor, nearest_k: int) -> dict:
     """
     Density and Coverage only - deliberately skips precision/recall. Recall is
     the only one of the four PRDC metrics that needs a fake-vs-fake pairwise
@@ -138,17 +208,17 @@ def compute_density_coverage(real_dc_radii: np.ndarray, real_features: np.ndarra
     pre-cached via build_cached_real_dc_radii) and real-vs-fake distances, so
     skipping precision/recall avoids computing that extra matrix entirely.
     """
-    distance_real_fake = cdist(real_features, fake_features)  # (n_real, n_fake)
+    distance_real_fake = torch.cdist(real_features, fake_features)  # (n_real, n_fake)
 
     density = (1.0 / nearest_k) * (
-        distance_real_fake < np.expand_dims(real_dc_radii, axis=1)
-    ).sum(axis=0).mean()
+        distance_real_fake < real_dc_radii.unsqueeze(1)
+    ).sum(dim=0).float().mean()
 
     coverage = (
-        distance_real_fake.min(axis=1) < real_dc_radii
-    ).mean()
+        distance_real_fake.min(dim=1).values < real_dc_radii
+    ).float().mean()
 
-    return {"density": float(density), "coverage": float(coverage)}
+    return {"density": density.item(), "coverage": coverage.item()}
 
 
 def calculate_fid_from_model(real_ds, model, batch_size: int = 128, device: torch.device = None):

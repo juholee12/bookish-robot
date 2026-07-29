@@ -127,19 +127,47 @@ test_dataset = datasets.MNIST(root="./data", train=False, download=True, transfo
 test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 full_digit_indices = utils.create_balanced_subset_indices(full_dataset, seed=base_seed)
 
-# Real-image FID features never change across iterations, so compute them once
-# and reuse for every fid_unfiltered/fid_filtered call instead of re-running
-# Inception over the same 10,000 real test images every time.
-real_fid_metric = fid_helper.build_cached_real_fid(test_dataset, device=device)
+# ---------------------------------------------------------------------------
+# Embedding function for FID / Density / Coverage
+# ---------------------------------------------------------------------------
+# InceptionV3 (ImageNet-pretrained) is a poor fit for small grayscale MNIST
+# digits - domain mismatch, forced 28->299 upsampling, and its features are
+# shaped to discriminate natural photos, not stroke style. Instead, train a
+# plain autoencoder directly on real MNIST digits, once, and freeze it - its
+# bottleneck becomes the embedding space for every FID/density/coverage call
+# below. Reconstruction loss (unlike a classifier's cross-entropy loss) keeps
+# within-class style information (slant, stroke width) in the embedding,
+# which is exactly the axis this experiment is trying to measure.
+EMBEDDING_DIM = 64
+embedding_model = models.SimpleAutoencoder(embedding_dim=EMBEDDING_DIM).to(device)
+embedding_optimizer = torch.optim.Adam(embedding_model.parameters(), lr=1e-3)
+embedding_train_loader = DataLoader(full_dataset, batch_size=256, shuffle=True)
 
-# Same real-image Inception features, reused for Density/Coverage every
-# iteration instead of re-extracting them each time. real_dc_radii (each real
-# sample's k-th nearest-neighbor distance to other real samples) is also
-# cached once here since it only depends on real_prdc_features, which never
-# changes - this is the expensive (N_real x N_real) part of the computation.
+print("Training frozen embedding autoencoder on real MNIST images...")
+embedding_model.train()
+for _epoch in range(30):
+    _epoch_loss = 0.0
+    for x, _ in embedding_train_loader:
+        x = x.to(device)
+        recon, _ = embedding_model(x)
+        loss = F.binary_cross_entropy(recon, x)
+        embedding_optimizer.zero_grad()
+        loss.backward()
+        embedding_optimizer.step()
+        _epoch_loss += loss.item() * x.size(0)
+    _epoch_loss /= len(full_dataset)
+print(f"Embedding autoencoder final reconstruction loss: {_epoch_loss:.4f}")
+embedding_model.eval()
+
+# Real-image embedding features never change across iterations, so compute
+# them once and reuse for every fid_unfiltered/fid_filtered call instead of
+# re-running the embedding model over the same 10,000 real test images every
+# time. real_dc_radii (each real sample's k-th nearest-neighbor distance to
+# other real samples) and real_fid_mu/real_fid_sigma are cached the same way.
 PRDC_NEAREST_K = 10
-real_prdc_features = fid_helper.extract_inception_features(real_fid_metric, test_dataset, device=device)
-real_dc_radii = fid_helper.build_cached_real_dc_radii(real_prdc_features, PRDC_NEAREST_K)
+real_embedding_features = fid_helper.extract_embedding_features(embedding_model, test_dataset, device=device)
+real_dc_radii = fid_helper.build_cached_real_dc_radii(real_embedding_features, PRDC_NEAREST_K)
+real_fid_mu, real_fid_sigma = fid_helper.compute_real_fid_stats(real_embedding_features)
 
 
 def _build_real_half(real_dataset, device):
@@ -189,7 +217,14 @@ init_train_loader = DataLoader(init_dataset, batch_size=128, shuffle=True)
 init_model = models.CVAE(input_dim=784, label_dim=10, latent_dim=20, name="cvae_real_500", arch="conv").to(device)
 train_helper.train_model(model=init_model, train_loader=init_train_loader, device=device, epochs=200, lr=1e-3, patience=5, verbose=False)
 val_loss, val_recon, val_kl = train_helper.calculate_validation_loss(init_model, test_loader, device)
-fid = fid_helper.calculate_fid_from_model(real_ds=test_dataset, model=init_model, device=device)
+init_synth_images, init_synth_labels = data_helper.generate_balanced_synthetic_data(
+    synthetic_model=init_model, target_size=len(test_dataset), device=device,
+)
+init_synth_features = fid_helper.extract_embedding_features(
+    embedding_model, TensorDataset(init_synth_images, init_synth_labels), device=device,
+)
+fid = fid_helper.calculate_fid_from_features(real_fid_mu, real_fid_sigma, init_synth_features)
+del init_synth_images, init_synth_labels, init_synth_features
 print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val_kl", val_kl)
 
 # ---------------------------------------------------------------------------
@@ -199,9 +234,9 @@ print("init model fid", fid, "val_NELBO", val_loss, "val_recon", val_recon, "val
 # freshly resampled, constant-size synthetic batch from the previous model,
 # discarding all prior generations - matches Gerstgrasser et al. 2024's
 # classic model-collapse baseline, as opposed to a growing "Replace-Multiple"
-# schedule). 10,000 keeps FID reasonably well-conditioned (Inception features
-# are 2048-dim; too few samples biases FID upward from sampling noise alone)
-# while staying far cheaper per-iteration than the old growing schedule.
+# schedule). 10,000 keeps FID/PRDC well-conditioned relative to the 64-dim
+# embedding (see EMBEDDING_DIM above) while staying far cheaper per-iteration
+# than the old growing schedule.
 delta_size = 10_000
 total_iterations = 50
 test_results = {
@@ -259,13 +294,11 @@ for i, synthetic_size in enumerate(size_schedule):
     unfiltered_images, unfiltered_labels = data_helper.generate_balanced_synthetic_data(
         synthetic_model=this_model, target_size=synthetic_size, device=device,
     )
-    fid_unfiltered = fid_helper.calculate_fid_score_cached(
-        real_fid_metric, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
+    unfiltered_features = fid_helper.extract_embedding_features(
+        embedding_model, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
     )
-    unfiltered_features = fid_helper.extract_inception_features(
-        real_fid_metric, TensorDataset(unfiltered_images, unfiltered_labels), device=device,
-    )
-    dc_unfiltered = fid_helper.compute_density_coverage(real_dc_radii, real_prdc_features, unfiltered_features, PRDC_NEAREST_K)
+    fid_unfiltered = fid_helper.calculate_fid_from_features(real_fid_mu, real_fid_sigma, unfiltered_features)
+    dc_unfiltered = fid_helper.compute_density_coverage(real_dc_radii, real_embedding_features, unfiltered_features, PRDC_NEAREST_K)
     save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
     del unfiltered_images, unfiltered_labels, unfiltered_features
     t_unfiltered = time.time() - t0
@@ -295,9 +328,9 @@ for i, synthetic_size in enumerate(size_schedule):
 
     # Measure FID directly on the filtered data used to train the next model
     t0 = time.time()
-    fid_filtered = fid_helper.calculate_fid_score_cached(real_fid_metric, synthetic_loader.dataset, device=device)
-    filtered_features = fid_helper.extract_inception_features(real_fid_metric, synthetic_loader.dataset, device=device)
-    dc_filtered = fid_helper.compute_density_coverage(real_dc_radii, real_prdc_features, filtered_features, PRDC_NEAREST_K)
+    filtered_features = fid_helper.extract_embedding_features(embedding_model, synthetic_loader.dataset, device=device)
+    fid_filtered = fid_helper.calculate_fid_from_features(real_fid_mu, real_fid_sigma, filtered_features)
+    dc_filtered = fid_helper.compute_density_coverage(real_dc_radii, real_embedding_features, filtered_features, PRDC_NEAREST_K)
     del filtered_features
     t_filtered_metrics = time.time() - t0
 

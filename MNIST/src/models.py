@@ -595,3 +595,47 @@ class ConditionalDiscriminator(nn.Module):
     def __repr__(self):
         return f"CondiDisc(name={self.name}, arch={self.arch})"
 
+
+class SimpleAutoencoder(nn.Module):
+    """
+    Plain (non-variational) autoencoder trained once on real MNIST images and
+    then frozen, to serve as a domain-appropriate embedding function for
+    FID/density/coverage - reconstruction loss preserves within-class stroke
+    style (unlike a classifier's features, which are trained to discard it),
+    and there's no ImageNet/resolution mismatch since it's trained directly
+    on 28x28 digits.
+    """
+
+    def __init__(self, embedding_dim=64):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+
+        self.encoder_conv = nn.Sequential(
+            nn.Conv2d(1, 32, 4, 2, 1), nn.ReLU(),   # 28 -> 14
+            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(),  # 14 -> 7
+        )
+        self.fc_enc = nn.Linear(64 * 7 * 7, embedding_dim)
+
+        self.fc_dec = nn.Linear(embedding_dim, 64 * 7 * 7)
+        self.decoder_conv = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),  # 7 -> 14
+            nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Sigmoid(),  # 14 -> 28
+        )
+
+    def encode(self, x):
+        if x.dim() == 2:
+            x = x.view(-1, 1, 28, 28)
+        h = self.encoder_conv(x)
+        h = h.view(h.size(0), -1)
+        return self.fc_enc(h)
+
+    def decode(self, z):
+        h = self.fc_dec(z)
+        h = h.view(-1, 64, 7, 7)
+        return self.decoder_conv(h)
+
+    def forward(self, x):
+        z = self.encode(x)
+        recon = self.decode(z)
+        return recon, z
+
