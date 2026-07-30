@@ -169,6 +169,17 @@ real_embedding_features = fid_helper.extract_embedding_features(embedding_model,
 real_dc_radii = fid_helper.build_cached_real_dc_radii(real_embedding_features, PRDC_NEAREST_K)
 real_fid_mu, real_fid_sigma = fid_helper.compute_real_fid_stats(real_embedding_features)
 
+# Per-class real labels/radii for the stratified density/coverage check: pooled
+# density/coverage can't distinguish "fake population got more diverse" from
+# "fake digits got sharper and more separated between classes" - both inflate
+# the pooled metric identically. Stratifying by class removes that confound.
+real_labels_for_dc = torch.tensor(
+    [test_dataset[i][1] for i in range(len(test_dataset))], dtype=torch.long, device=device,
+)
+real_dc_radii_per_class = fid_helper.build_cached_real_dc_radii_per_class(
+    real_embedding_features, real_labels_for_dc, PRDC_NEAREST_K,
+)
+
 
 def _build_real_half(real_dataset, device):
     """One-time extraction of a real dataset's images + one-hot(digit, is_real=1) labels."""
@@ -243,6 +254,8 @@ test_results = {
     "model_name": [], "fid_unfiltered": [], "fid_filtered": [],
     "density_unfiltered": [], "coverage_unfiltered": [],
     "density_filtered": [], "coverage_filtered": [],
+    "density_stratified_unfiltered": [], "coverage_stratified_unfiltered": [],
+    "density_stratified_filtered": [], "coverage_stratified_filtered": [],
     "val_loss": [], "val_recon": [], "val_kl": [],
     "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
@@ -299,6 +312,10 @@ for i, synthetic_size in enumerate(size_schedule):
     )
     fid_unfiltered = fid_helper.calculate_fid_from_features(real_fid_mu, real_fid_sigma, unfiltered_features)
     dc_unfiltered = fid_helper.compute_density_coverage(real_dc_radii, real_embedding_features, unfiltered_features, PRDC_NEAREST_K)
+    dc_stratified_unfiltered = fid_helper.compute_density_coverage_stratified(
+        real_dc_radii_per_class, real_embedding_features, real_labels_for_dc,
+        unfiltered_features, unfiltered_labels.to(device), PRDC_NEAREST_K,
+    )
     save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
     del unfiltered_images, unfiltered_labels, unfiltered_features
     t_unfiltered = time.time() - t0
@@ -329,9 +346,14 @@ for i, synthetic_size in enumerate(size_schedule):
     # Measure FID directly on the filtered data used to train the next model
     t0 = time.time()
     filtered_features = fid_helper.extract_embedding_features(embedding_model, synthetic_loader.dataset, device=device)
+    filtered_labels = fid_helper.extract_labels(synthetic_loader.dataset).to(device)
     fid_filtered = fid_helper.calculate_fid_from_features(real_fid_mu, real_fid_sigma, filtered_features)
     dc_filtered = fid_helper.compute_density_coverage(real_dc_radii, real_embedding_features, filtered_features, PRDC_NEAREST_K)
-    del filtered_features
+    dc_stratified_filtered = fid_helper.compute_density_coverage_stratified(
+        real_dc_radii_per_class, real_embedding_features, real_labels_for_dc,
+        filtered_features, filtered_labels, PRDC_NEAREST_K,
+    )
+    del filtered_features, filtered_labels
     t_filtered_metrics = time.time() - t0
 
     t0 = time.time()
@@ -361,6 +383,10 @@ for i, synthetic_size in enumerate(size_schedule):
     test_results["coverage_unfiltered"].append(dc_unfiltered["coverage"])
     test_results["density_filtered"].append(dc_filtered["density"])
     test_results["coverage_filtered"].append(dc_filtered["coverage"])
+    test_results["density_stratified_unfiltered"].append(dc_stratified_unfiltered["density_stratified"])
+    test_results["coverage_stratified_unfiltered"].append(dc_stratified_unfiltered["coverage_stratified"])
+    test_results["density_stratified_filtered"].append(dc_stratified_filtered["density_stratified"])
+    test_results["coverage_stratified_filtered"].append(dc_stratified_filtered["coverage_stratified"])
     test_results["val_loss"].append(val_loss)
     test_results["val_recon"].append(val_recon)
     test_results["val_kl"].append(val_kl)
@@ -376,6 +402,10 @@ for i, synthetic_size in enumerate(size_schedule):
         "coverage_unfiltered": test_results["coverage_unfiltered"][-1],
         "density_filtered": test_results["density_filtered"][-1],
         "coverage_filtered": test_results["coverage_filtered"][-1],
+        "density_stratified_unfiltered": test_results["density_stratified_unfiltered"][-1],
+        "coverage_stratified_unfiltered": test_results["coverage_stratified_unfiltered"][-1],
+        "density_stratified_filtered": test_results["density_stratified_filtered"][-1],
+        "coverage_stratified_filtered": test_results["coverage_stratified_filtered"][-1],
         "val_loss": test_results["val_loss"][-1],
         "val_recon": test_results["val_recon"][-1],
         "val_kl": test_results["val_kl"][-1],
@@ -386,7 +416,9 @@ for i, synthetic_size in enumerate(size_schedule):
     save_metric_plots(test_results, plots_saved_path)
 
     print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, "
-          f"Coverage filtered: {test_results['coverage_filtered'][-1]:.3f}, Density filtered: {test_results['density_filtered'][-1]:.3f}, Test NELBO: {test_results['val_loss'][-1]:.2f}")
+          f"Coverage filtered: {test_results['coverage_filtered'][-1]:.3f} (stratified: {test_results['coverage_stratified_filtered'][-1]:.3f}), "
+          f"Density filtered: {test_results['density_filtered'][-1]:.3f} (stratified: {test_results['density_stratified_filtered'][-1]:.3f}), "
+          f"Test NELBO: {test_results['val_loss'][-1]:.2f}")
 
     del synthetic_loader
     del disc_model

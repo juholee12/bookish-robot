@@ -221,6 +221,84 @@ def compute_density_coverage(real_dc_radii: torch.Tensor, real_features: torch.T
     return {"density": density.item(), "coverage": coverage.item()}
 
 
+@torch.no_grad()
+def extract_labels(dataset, batch_size: int = 256) -> torch.Tensor:
+    """
+    Pull every label out of a dataset that yields (image, label) pairs,
+    concatenated into one tensor in dataset order - a label-only counterpart
+    to extract_embedding_features/extract_inception_features, used to build
+    the per-class masks needed by the stratified density/coverage functions
+    below (e.g. DirectoryBasedSyntheticDataset exposes labels only through
+    __getitem__, one file at a time, with no single all-labels attribute).
+    """
+    labels = []
+    for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
+        lbl = batch[1] if isinstance(batch, (list, tuple)) else batch
+        labels.append(torch.as_tensor(lbl))
+    return torch.cat(labels, dim=0)
+
+
+@torch.no_grad()
+def build_cached_real_dc_radii_per_class(real_features: torch.Tensor, real_labels: torch.Tensor, nearest_k: int, num_classes: int = 10) -> dict:
+    """
+    Per-class counterpart to build_cached_real_dc_radii: computes each real
+    sample's k-th nearest-neighbor distance among *other real samples of the
+    same class only*, instead of pooling all classes into one manifold.
+
+    Motivation: pooled density/coverage can't tell "the fake population spans
+    more of the real manifold because it's more diverse" apart from "the fake
+    population spans more of the real manifold because digits became sharper
+    and better separated *between* classes" - both inflate the pooled metric
+    the same way. Stratifying by class removes that confound, since between-
+    class separation can no longer contribute; only within-class spread can.
+    """
+    radii_by_class = {}
+    for c in range(num_classes):
+        mask = real_labels == c
+        radii_by_class[c] = build_cached_real_dc_radii(real_features[mask], nearest_k)
+    return radii_by_class
+
+
+@torch.no_grad()
+def compute_density_coverage_stratified(
+    real_dc_radii_per_class: dict,
+    real_features: torch.Tensor,
+    real_labels: torch.Tensor,
+    fake_features: torch.Tensor,
+    fake_labels: torch.Tensor,
+    nearest_k: int,
+    num_classes: int = 10,
+) -> dict:
+    """
+    Per-class density/coverage, each class's fake samples only ever compared
+    against real samples of that same class. Returns per-class scores plus a
+    macro-average (equal weight per class, matching generate_balanced_synthetic_data's
+    equal-per-digit sampling) - the macro-average is the number to compare
+    directly against the pooled density/coverage from compute_density_coverage.
+    """
+    per_class = {}
+    for c in range(num_classes):
+        real_mask = real_labels == c
+        fake_mask = fake_labels == c
+        if fake_mask.sum() == 0 or real_mask.sum() == 0:
+            per_class[c] = {"density": float("nan"), "coverage": float("nan")}
+            continue
+        per_class[c] = compute_density_coverage(
+            real_dc_radii_per_class[c],
+            real_features[real_mask],
+            fake_features[fake_mask],
+            nearest_k,
+        )
+
+    densities = [v["density"] for v in per_class.values() if not np.isnan(v["density"])]
+    coverages = [v["coverage"] for v in per_class.values() if not np.isnan(v["coverage"])]
+    return {
+        "per_class": per_class,
+        "density_stratified": float(np.mean(densities)) if densities else float("nan"),
+        "coverage_stratified": float(np.mean(coverages)) if coverages else float("nan"),
+    }
+
+
 def calculate_fid_from_model(real_ds, model, batch_size: int = 128, device: torch.device = None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
