@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 from scipy.linalg import sqrtm
@@ -297,6 +298,148 @@ def compute_density_coverage_stratified(
         "density_stratified": float(np.mean(densities)) if densities else float("nan"),
         "coverage_stratified": float(np.mean(coverages)) if coverages else float("nan"),
     }
+
+
+@torch.no_grad()
+def compute_kid(
+    real_features: torch.Tensor,
+    fake_features: torch.Tensor,
+    subset_size: int = 1000,
+    num_subsets: int = 10,
+    degree: int = 3,
+    coef0: float = 1.0,
+) -> float:
+    """
+    Kernel Inception Distance (Binkowski et al., 2018): unbiased polynomial-
+    kernel MMD^2 between real and fake embeddings. Unlike FID, this makes no
+    Gaussianity assumption on the embedding distribution - relevant here
+    since nothing guarantees the 64-d autoencoder embedding is close to
+    Gaussian - and its estimator is unbiased at any sample size, whereas
+    FID's plug-in mean/covariance estimate is biased at small N.
+
+    Computed via the standard subset-averaging estimator (repeatedly drawing
+    a `subset_size` sample from each population and averaging the unbiased
+    MMD^2 estimate across `num_subsets` draws) rather than a single pass over
+    all N samples, since a full N x N kernel matrix at N=10,000 would be
+    expensive to rebuild every iteration for no accuracy benefit.
+    """
+    m_total = real_features.shape[0]
+    n_total = fake_features.shape[0]
+    subset_size = min(subset_size, m_total, n_total)
+    gamma = 1.0 / real_features.shape[1]
+
+    scores = []
+    for _ in range(num_subsets):
+        real_idx = torch.randperm(m_total, device=real_features.device)[:subset_size]
+        fake_idx = torch.randperm(n_total, device=fake_features.device)[:subset_size]
+        x = real_features[real_idx]
+        y = fake_features[fake_idx]
+
+        k_xx = (gamma * (x @ x.T) + coef0) ** degree
+        k_yy = (gamma * (y @ y.T) + coef0) ** degree
+        k_xy = (gamma * (x @ y.T) + coef0) ** degree
+
+        m = subset_size
+        sum_xx = (k_xx.sum() - k_xx.diagonal().sum()) / (m * (m - 1))
+        sum_yy = (k_yy.sum() - k_yy.diagonal().sum()) / (m * (m - 1))
+        sum_xy = k_xy.mean()
+
+        scores.append((sum_xx + sum_yy - 2 * sum_xy).item())
+
+    return float(np.mean(scores))
+
+
+@torch.no_grad()
+def compute_vendi_score(features: torch.Tensor) -> float:
+    """
+    Vendi Score (Friedman & Dieng, 2023): exp(Shannon entropy of the
+    eigenvalues of the normalized cosine-similarity matrix over a set of
+    embeddings). Reference-free - it never looks at real data - so it
+    measures purely how many effectively distinct samples the fake set
+    contains. This is the axis density/coverage cannot see: a generator that
+    collapses onto a single mode per class but sits exactly on the densest
+    part of the real manifold can still score well on coverage, since
+    coverage only asks "is some fake sample near this real sample," not
+    "are the fake samples different from each other."
+    """
+    n = features.shape[0]
+    normed = F.normalize(features, dim=1)
+    K = (normed @ normed.T) / n
+    eigenvalues = torch.linalg.eigvalsh(K).clamp(min=0)
+    eigenvalues = eigenvalues[eigenvalues > 1e-12]
+    p = eigenvalues / eigenvalues.sum()
+    entropy = -(p * p.log()).sum()
+    return torch.exp(entropy).item()
+
+
+@torch.no_grad()
+def compute_vendi_score_per_class(features: torch.Tensor, labels: torch.Tensor, num_classes: int = 10) -> dict:
+    """
+    Vendi score computed separately within each digit class, then averaged -
+    directly targets within-class style collapse (e.g. always drawing the
+    same "7"), which class-pooled diagnostics (a classifier's predicted-label
+    entropy, or pooled density/coverage) cannot detect since a single
+    dominant style per class still classifies correctly and still overlaps
+    the real manifold.
+    """
+    per_class = {}
+    for c in range(num_classes):
+        mask = labels == c
+        if mask.sum() < 2:
+            per_class[c] = float("nan")
+            continue
+        per_class[c] = compute_vendi_score(features[mask])
+    valid = [v for v in per_class.values() if not np.isnan(v)]
+    return {
+        "per_class": per_class,
+        "vendi_mean": float(np.mean(valid)) if valid else float("nan"),
+    }
+
+
+@torch.no_grad()
+def compute_class_mode_coverage(
+    classifier,
+    dataset,
+    device: torch.device,
+    num_classes: int = 10,
+    batch_size: int = 512,
+) -> dict:
+    """
+    Oracle mode-coverage check via an independently-trained digit classifier
+    (never the adversarial discriminator, never the autoencoder embedding -
+    conflating either would entangle this check with the models actually
+    being evaluated/trained). Reports:
+      - class_entropy: Shannon entropy of the predicted-label histogram,
+        normalized by log(num_classes) so 1.0 = perfectly uniform over all
+        10 digits and 0.0 = collapsed onto a single digit. Catches *between*-
+        class mode dropping directly - near-ground-truth given how accurate
+        MNIST classifiers are - but is blind to *within*-class style
+        collapse (pair with compute_vendi_score_per_class for that).
+      - label_match_rate: fraction of samples whose predicted digit matches
+        the label the generator was conditioned on - a fidelity check
+        independent of FID/KID.
+    """
+    classifier.eval()
+    all_preds, all_intended = [], []
+    for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
+        imgs, intended = batch
+        imgs = imgs.float().to(device)
+        if imgs.max() > 1.0:
+            imgs = imgs / 255.0
+        logits = classifier(imgs)
+        all_preds.append(logits.argmax(dim=1).cpu())
+        all_intended.append(torch.as_tensor(intended).cpu())
+    preds = torch.cat(all_preds, dim=0)
+    intended = torch.cat(all_intended, dim=0)
+
+    counts = torch.bincount(preds, minlength=num_classes).float()
+    probs = counts / counts.sum()
+    nonzero = probs[probs > 0]
+    entropy = -(nonzero * nonzero.log()).sum().item()
+    normalized_entropy = entropy / np.log(num_classes)
+    match_rate = (preds == intended).float().mean().item()
+
+    return {"class_entropy": normalized_entropy, "label_match_rate": match_rate}
 
 
 def calculate_fid_from_model(real_ds, model, batch_size: int = 128, device: torch.device = None):

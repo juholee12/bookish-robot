@@ -159,6 +159,33 @@ for _epoch in range(30):
 print(f"Embedding autoencoder final reconstruction loss: {_epoch_loss:.4f}")
 embedding_model.eval()
 
+# Independent, once-trained, frozen oracle digit classifier - used only for
+# the mode-coverage check (predicted-label histogram entropy + label match
+# rate) below. Deliberately separate from ConditionalDiscriminator (real/fake,
+# retrained adversarially every iteration) and SimpleAutoencoder (an
+# embedding, not a classifier) so this check never entangles with the models
+# actually being evaluated.
+digit_classifier = models.MNISTClassifier().to(device)
+classifier_optimizer = torch.optim.Adam(digit_classifier.parameters(), lr=1e-3)
+classifier_train_loader = DataLoader(full_dataset, batch_size=256, shuffle=True)
+
+print("Training frozen oracle digit classifier on real MNIST images...")
+digit_classifier.train()
+for _epoch in range(5):
+    for x, y in classifier_train_loader:
+        x, y = x.to(device), y.to(device)
+        logits = digit_classifier(x)
+        loss = F.cross_entropy(logits, y)
+        classifier_optimizer.zero_grad()
+        loss.backward()
+        classifier_optimizer.step()
+digit_classifier.eval()
+_classifier_test_acc = (
+    digit_classifier(torch.stack([test_dataset[i][0] for i in range(len(test_dataset))]).to(device)).argmax(dim=1)
+    == torch.tensor([test_dataset[i][1] for i in range(len(test_dataset))], device=device)
+).float().mean().item()
+print(f"Oracle digit classifier test accuracy: {_classifier_test_acc:.4f}")
+
 # Real-image embedding features never change across iterations, so compute
 # them once and reuse for every fid_unfiltered/fid_filtered call instead of
 # re-running the embedding model over the same 10,000 real test images every
@@ -256,6 +283,10 @@ test_results = {
     "density_filtered": [], "coverage_filtered": [],
     "density_stratified_unfiltered": [], "coverage_stratified_unfiltered": [],
     "density_stratified_filtered": [], "coverage_stratified_filtered": [],
+    "kid_unfiltered": [], "kid_filtered": [],
+    "vendi_unfiltered": [], "vendi_filtered": [],
+    "class_entropy_unfiltered": [], "label_match_rate_unfiltered": [],
+    "class_entropy_filtered": [], "label_match_rate_filtered": [],
     "val_loss": [], "val_recon": [], "val_kl": [],
     "disc_train_loss": [], "disc_val_loss": [], "disc_test_accuracy": [],
 }
@@ -316,6 +347,11 @@ for i, synthetic_size in enumerate(size_schedule):
         real_dc_radii_per_class, real_embedding_features, real_labels_for_dc,
         unfiltered_features, unfiltered_labels.to(device), PRDC_NEAREST_K,
     )
+    kid_unfiltered = fid_helper.compute_kid(real_embedding_features, unfiltered_features)
+    vendi_unfiltered = fid_helper.compute_vendi_score_per_class(unfiltered_features, unfiltered_labels.to(device))
+    mode_unfiltered = fid_helper.compute_class_mode_coverage(
+        digit_classifier, TensorDataset(unfiltered_images, unfiltered_labels), device,
+    )
     save_preview_grid(unfiltered_images, unfiltered_labels, os.path.join(picture_saved_path, f"iter{i}_unfiltered.png"))
     del unfiltered_images, unfiltered_labels, unfiltered_features
     t_unfiltered = time.time() - t0
@@ -353,6 +389,9 @@ for i, synthetic_size in enumerate(size_schedule):
         real_dc_radii_per_class, real_embedding_features, real_labels_for_dc,
         filtered_features, filtered_labels, PRDC_NEAREST_K,
     )
+    kid_filtered = fid_helper.compute_kid(real_embedding_features, filtered_features)
+    vendi_filtered = fid_helper.compute_vendi_score_per_class(filtered_features, filtered_labels)
+    mode_filtered = fid_helper.compute_class_mode_coverage(digit_classifier, synthetic_loader.dataset, device)
     del filtered_features, filtered_labels
     t_filtered_metrics = time.time() - t0
 
@@ -387,6 +426,14 @@ for i, synthetic_size in enumerate(size_schedule):
     test_results["coverage_stratified_unfiltered"].append(dc_stratified_unfiltered["coverage_stratified"])
     test_results["density_stratified_filtered"].append(dc_stratified_filtered["density_stratified"])
     test_results["coverage_stratified_filtered"].append(dc_stratified_filtered["coverage_stratified"])
+    test_results["kid_unfiltered"].append(kid_unfiltered)
+    test_results["kid_filtered"].append(kid_filtered)
+    test_results["vendi_unfiltered"].append(vendi_unfiltered["vendi_mean"])
+    test_results["vendi_filtered"].append(vendi_filtered["vendi_mean"])
+    test_results["class_entropy_unfiltered"].append(mode_unfiltered["class_entropy"])
+    test_results["label_match_rate_unfiltered"].append(mode_unfiltered["label_match_rate"])
+    test_results["class_entropy_filtered"].append(mode_filtered["class_entropy"])
+    test_results["label_match_rate_filtered"].append(mode_filtered["label_match_rate"])
     test_results["val_loss"].append(val_loss)
     test_results["val_recon"].append(val_recon)
     test_results["val_kl"].append(val_kl)
@@ -406,6 +453,14 @@ for i, synthetic_size in enumerate(size_schedule):
         "coverage_stratified_unfiltered": test_results["coverage_stratified_unfiltered"][-1],
         "density_stratified_filtered": test_results["density_stratified_filtered"][-1],
         "coverage_stratified_filtered": test_results["coverage_stratified_filtered"][-1],
+        "kid_unfiltered": test_results["kid_unfiltered"][-1],
+        "kid_filtered": test_results["kid_filtered"][-1],
+        "vendi_unfiltered": test_results["vendi_unfiltered"][-1],
+        "vendi_filtered": test_results["vendi_filtered"][-1],
+        "class_entropy_unfiltered": test_results["class_entropy_unfiltered"][-1],
+        "label_match_rate_unfiltered": test_results["label_match_rate_unfiltered"][-1],
+        "class_entropy_filtered": test_results["class_entropy_filtered"][-1],
+        "label_match_rate_filtered": test_results["label_match_rate_filtered"][-1],
         "val_loss": test_results["val_loss"][-1],
         "val_recon": test_results["val_recon"][-1],
         "val_kl": test_results["val_kl"][-1],
@@ -416,8 +471,11 @@ for i, synthetic_size in enumerate(size_schedule):
     save_metric_plots(test_results, plots_saved_path)
 
     print(f"Iteration {i} - Ending model: {this_model.get_name()}, FID unfiltered: {test_results['fid_unfiltered'][-1]:.2f}, FID filtered: {test_results['fid_filtered'][-1]:.2f}, "
+          f"KID filtered: {test_results['kid_filtered'][-1]:.4f}, "
           f"Coverage filtered: {test_results['coverage_filtered'][-1]:.3f} (stratified: {test_results['coverage_stratified_filtered'][-1]:.3f}), "
           f"Density filtered: {test_results['density_filtered'][-1]:.3f} (stratified: {test_results['density_stratified_filtered'][-1]:.3f}), "
+          f"Vendi filtered: {test_results['vendi_filtered'][-1]:.2f}, "
+          f"Class entropy filtered: {test_results['class_entropy_filtered'][-1]:.3f}, Label match filtered: {test_results['label_match_rate_filtered'][-1]:.3f}, "
           f"Test NELBO: {test_results['val_loss'][-1]:.2f}")
 
     del synthetic_loader

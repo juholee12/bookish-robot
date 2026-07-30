@@ -639,3 +639,37 @@ class SimpleAutoencoder(nn.Module):
         recon = self.decode(z)
         return recon, z
 
+
+class MNISTClassifier(nn.Module):
+    """
+    Plain supervised 10-way digit classifier, trained once on real MNIST and
+    then frozen - used only as an oracle mode-coverage check (predicted-label
+    histogram entropy, and predicted-vs-intended label match rate) over
+    generated samples. Kept separate from ConditionalDiscriminator (which
+    does real-vs-fake binary classification and is retrained adversarially
+    every iteration) and from SimpleAutoencoder (which is an embedding, not a
+    classifier) - conflating either with this check would entangle it with
+    the same models being evaluated.
+    """
+
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.num_classes = num_classes
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),                        # 28 -> 14
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),                        # 14 -> 7
+        )
+        self.head = nn.Sequential(
+            nn.Linear(64 * 7 * 7, 128), nn.ReLU(),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.view(-1, 1, 28, 28)
+        h = self.features(x)
+        h = h.view(h.size(0), -1)
+        return self.head(h)
+
