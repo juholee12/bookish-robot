@@ -163,11 +163,15 @@ REAL_MIX_RATIO = 0.1
 BINARIZE_REAL_MIX = True
 
 
-def write_real_mix_shard(save_directory, n_real, generation, digit_indices, dataset, num_classes=10):
-    """Sample a fresh, digit-balanced batch of real MNIST images and write it into
-    save_directory as one more .pt shard, in the same {'images','labels'} format
-    the synthetic shards use, so create_directory_based_dataloader picks it up
-    alongside them with no special-casing.
+def merge_real_mix_into_shards(save_directory, n_real, generation, digit_indices, dataset, num_classes=10):
+    """Sample a fresh, digit-balanced batch of real MNIST images, merge it with the
+    filtered synthetic shards already in save_directory, shuffle, and replace them
+    with a single combined shard.
+
+    The merge-and-shuffle is required: create_directory_based_dataloader never
+    shuffles and reads shards in filename order, so a separate real shard would be
+    seen as a contiguous, digit-sorted block at the end of every epoch instead of
+    being spread ~rho per batch.
 
     Sampling is fresh every generation (drawn from the full 60k training pool,
     without replacement within a generation), so the mixing stream never degrades
@@ -179,14 +183,28 @@ def write_real_mix_shard(save_directory, n_real, generation, digit_indices, data
         pool = digit_indices[digit]
         chosen.extend(random.sample(pool, per_digit))
 
-    images = torch.stack([dataset[j][0] for j in chosen])
-    labels = torch.tensor([dataset[j][1] for j in chosen], dtype=torch.long)
+    real_images = torch.stack([dataset[j][0] for j in chosen])
+    real_labels = torch.tensor([dataset[j][1] for j in chosen], dtype=torch.long)
     if BINARIZE_REAL_MIX:
-        images = (images > 0.5).float()
+        real_images = (real_images > 0.5).float()
 
-    shard_path = os.path.join(save_directory, f"realmix_{len(images)}_g{generation}.pt")
-    torch.save({"images": images, "labels": labels}, shard_path)
-    return images, labels
+    synth_shard_paths = sorted(glob.glob(os.path.join(save_directory, "*.pt")))
+    images_parts, labels_parts = [real_images], [real_labels]
+    for path in synth_shard_paths:
+        shard = torch.load(path, map_location="cpu")
+        images_parts.append(shard["images"].float())
+        labels_parts.append(shard["labels"].long())
+
+    images = torch.cat(images_parts, dim=0)
+    labels = torch.cat(labels_parts, dim=0)
+    perm = torch.randperm(len(images))
+    images, labels = images[perm], labels[perm]
+
+    for path in synth_shard_paths:
+        os.remove(path)
+    torch.save({"images": images, "labels": labels},
+               os.path.join(save_directory, f"mixed_{len(images)}_g{generation}.pt"))
+    return real_images, real_labels
 
 # ---------------------------------------------------------------------------
 # Embedding function for FID / Density / Coverage
@@ -439,10 +457,8 @@ for i, synthetic_size in enumerate(size_schedule):
     save_preview_grid(shard_data["images"], shard_data["labels"], os.path.join(picture_saved_path, f"iter{i}_filtered.png"))
     del shard_data
 
-    # Measure the filtered metrics on the synthetic portion ONLY. This loader is built
-    # before any real images land in the directory, and DirectoryBasedSyntheticDataset
-    # fixes its shard list at construction time, so it stays synthetic-only even after
-    # the real shard is written below. keep_data=True so its cleanup does not delete the
+    # Measure the filtered metrics on the synthetic portion ONLY, before real images are
+    # merged into the directory below. keep_data=True so its cleanup does not delete the
     # directory out from under the training loader.
     t0 = time.time()
     metrics_loader = data_helper.create_directory_based_dataloader(synthetic_data_load_path, batch_size=128, keep_data=True)
@@ -460,11 +476,11 @@ for i, synthetic_size in enumerate(size_schedule):
     del filtered_features, filtered_labels, metrics_loader
     t_filtered_metrics = time.time() - t0
 
-    # Mix in a fresh, digit-balanced batch of real MNIST images, then build the training
-    # loader over synthetic + real together (keep_data=False: this loader owns the scratch
-    # directory and deletes it once it goes out of scope at the end of the iteration).
+    # Merge a fresh, digit-balanced batch of real MNIST images into the synthetic shards
+    # and shuffle, then build the training loader (keep_data=False: this loader owns the
+    # scratch directory and deletes it once it goes out of scope at the end of the iteration).
     t0 = time.time()
-    real_mix_images, real_mix_labels = write_real_mix_shard(
+    real_mix_images, real_mix_labels = merge_real_mix_into_shards(
         synthetic_data_load_path, real_per_iteration, i, full_digit_indices, full_dataset,
     )
     save_preview_grid(real_mix_images, real_mix_labels, os.path.join(picture_saved_path, f"iter{i}_realmix.png"))
