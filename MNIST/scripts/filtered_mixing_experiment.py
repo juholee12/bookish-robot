@@ -192,7 +192,7 @@ def merge_real_mix_into_shards(save_directory, n_real, generation, digit_indices
     images_parts, labels_parts = [real_images], [real_labels]
     for path in synth_shard_paths:
         shard = torch.load(path, map_location="cpu")
-        images_parts.append(shard["images"].float())
+        images_parts.append(shard["images"].float().view(-1, 1, 28, 28))
         labels_parts.append(shard["labels"].long())
 
     images = torch.cat(images_parts, dim=0)
